@@ -20,6 +20,7 @@ if sys.version_info < (3, 11):  # noqa: UP036 - guard helps direct `python3 run_
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -76,10 +77,19 @@ SUBJECT_SLUG_MAX_WORDS = 4
 SUBJECT_SLUG_MAX_LEN = 60
 
 VISION_PROMPT = (
-    "Analyze the exact material textures, physical form, lighting environment, "
-    "and background context of the central object in this image. Provide a precise, "
-    "2-sentence description focusing strictly on verifiable visual details without "
-    "assuming unseeable attributes, to serve as a style and texture prompt modifier."
+    "Analyze this image and write a detailed, structured style description "
+    "(5-8 sentences) covering each of the following aspects, in order:\n"
+    "1. Composition and framing of the central object.\n"
+    "2. Color palette and saturation level.\n"
+    "3. Lighting — direction, quality, and contrast.\n"
+    "4. Material textures and surface finishes.\n"
+    "5. Physical form and proportions of the central object.\n"
+    "6. Background and surrounding environment.\n"
+    "7. Camera characteristics — lens, depth of field, and angle.\n"
+    "8. Overall mood and aesthetic.\n"
+    "Focus strictly on verifiable visual details you can observe; do not "
+    "invent attributes that are not visible. The output will be used as a "
+    "style and texture prompt modifier for an image generation model."
 )
 
 logger = logging.getLogger("mimicflux")
@@ -240,6 +250,11 @@ def cache_path_for(image_path: Path) -> Path:
     return image_path.parent / STYLE_CACHE_NAME
 
 
+def _vision_prompt_hash() -> str:
+    """Short hash of the current VISION_PROMPT, used to invalidate stale caches."""
+    return hashlib.sha256(VISION_PROMPT.encode("utf-8")).hexdigest()[:16]
+
+
 def style_cache_valid(cache_path: Path, image_path: Path, vision_model: str) -> bool:
     if not cache_path.exists() or not image_path.exists():
         return False
@@ -250,6 +265,8 @@ def style_cache_valid(cache_path: Path, image_path: Path, vision_model: str) -> 
     if not isinstance(data, dict) or not data.get("style"):
         return False
     if data.get("model") != vision_model:
+        return False
+    if data.get("prompt_hash") != _vision_prompt_hash():
         return False
     st = image_path.stat()
     return data.get("size") == st.st_size and data.get("mtime") == int(st.st_mtime)
@@ -272,6 +289,7 @@ def save_cached_style(
     payload = {
         "image": str(image_path),
         "model": vision_model,
+        "prompt_hash": _vision_prompt_hash(),
         "size": st.st_size,
         "mtime": int(st.st_mtime),
         "style": style,
