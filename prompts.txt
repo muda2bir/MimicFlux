@@ -1,2 +1,6 @@
-A photorealistic, perfectly set faceted Citrine with the ring clearly visible.
-A photorealistic, perfectly set faceted Labradorite with the ring clearly visible.
+prompt_1
+prompt_2
+.
+.
+.
+.
