@@ -1,0 +1,11 @@
+# 1. Private Configuration (Crucial!)
+.env
+
+# 2. Local Inputs & Outputs
+automated_outputs/
+my_style.jpeg
+
+# 3. System & Python Junk
+__pycache__/
+*.pyc
+.DS_Store
