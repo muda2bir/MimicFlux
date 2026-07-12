@@ -26,7 +26,8 @@ import logging
 import os
 import re
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -53,6 +54,7 @@ DEFAULT_VISION_MODEL = "openai/gpt-4o-mini"
 DEFAULT_IMAGE_MODEL = "black-forest-labs/flux.2-pro"
 DEFAULT_COOLDOWN_SECONDS = 4
 DEFAULT_OUTPUT_FORMAT = "png"
+MAX_REFERENCE_IMAGES = 5
 STYLE_CACHE_NAME = ".style_cache.txt"
 MANIFEST_NAME = "manifest.json"
 IMAGE_DOWNLOAD_TIMEOUT = 30
@@ -77,8 +79,8 @@ SUBJECT_SLUG_MAX_WORDS = 4
 SUBJECT_SLUG_MAX_LEN = 60
 
 VISION_PROMPT = (
-    "Analyze this image and write a detailed, structured style description "
-    "(5-8 sentences) covering each of the following aspects, in order:\n"
+    "Analyze the reference image(s) and write a dense, comma-separated style "
+    "description (5-8 sentences) covering each of the following aspects, in order:\n"
     "1. Composition and framing of the central object.\n"
     "2. Color palette and saturation level.\n"
     "3. Lighting — direction, quality, and contrast.\n"
@@ -87,9 +89,14 @@ VISION_PROMPT = (
     "6. Background and surrounding environment.\n"
     "7. Camera characteristics — lens, depth of field, and angle.\n"
     "8. Overall mood and aesthetic.\n"
-    "Focus strictly on verifiable visual details you can observe; do not "
-    "invent attributes that are not visible. The output will be used as a "
-    "style and texture prompt modifier for an image generation model."
+    "If multiple images are provided, synthesize their shared visual style "
+    "into one unified description. Focus strictly on verifiable visual "
+    "details you can observe; do not invent attributes that are not visible. "
+    "Do not describe the subject matter itself — only the visual style, "
+    "lighting, colors, textures, and camera work. Use concrete, specific "
+    "language (e.g. 'warm amber rim light from the left' rather than 'nice "
+    "lighting'). The output will be used as a style and texture prompt "
+    "modifier for an image generation model."
 )
 
 logger = logging.getLogger("mimicflux")
@@ -134,6 +141,62 @@ class ManifestEntry:
     error: str | None = None
 
 
+@dataclass
+class GenEvent:
+    """A single event emitted by :func:`run_generation` for the CLI or web UI."""
+
+    kind: str
+    payload: dict = field(default_factory=dict)
+
+
+@dataclass
+class GenerationOptions:
+    """Tweakable options shared by the CLI ``main()`` and the web UI."""
+
+    vision_model: str = DEFAULT_VISION_MODEL
+    image_model: str = DEFAULT_IMAGE_MODEL
+    cooldown: float = DEFAULT_COOLDOWN_SECONDS
+    no_cache: bool = False
+    force: bool = False
+    legacy_names: bool = False
+    dry_run: bool = False
+    output_format: str = DEFAULT_OUTPUT_FORMAT
+    no_img2img: bool = False
+    steps: int | None = None
+    guidance: float | None = None
+    seed: int | None = None
+
+    VALID_FORMATS: tuple[str, ...] = field(default=("png", "jpeg", "webp"), init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.output_format not in self.VALID_FORMATS:
+            raise ValueError(
+                f"output_format must be one of {self.VALID_FORMATS}, "
+                f"got {self.output_format!r}"
+            )
+        if self.steps is not None and not (1 <= self.steps <= 100):
+            raise ValueError(f"steps must be between 1 and 100, got {self.steps}")
+        if self.guidance is not None and not (0 <= self.guidance <= 20):
+            raise ValueError(f"guidance must be between 0 and 20, got {self.guidance}")
+        if self.seed is not None and self.seed < 0:
+            raise ValueError(f"seed must be non-negative, got {self.seed}")
+
+
+@dataclass
+class ModelCapabilities:
+    """Capabilities of an image model, queried from OpenRouter's Image API.
+
+    Defaults are optimistic so existing behavior is preserved when the
+    capability endpoint is unreachable or returns an unexpected response.
+    ``allowed_passthrough`` is ``None`` when unknown (don't filter) and a
+    list (possibly empty) when the API gave a definitive answer (do filter).
+    """
+
+    supports_img2img: bool = True
+    provider_slug: str = "black-forest-labs"
+    allowed_passthrough: list[str] | None = None
+
+
 # ==========================================
 # LOGGING
 # ==========================================
@@ -150,8 +213,11 @@ class TqdmHandler(logging.StreamHandler):
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    fmt = "%(asctime)s %(levelname)s %(message)s" if verbose else "%(message)s"
-    logging.basicConfig(level=level, format=fmt, handlers=[TqdmHandler()], force=True)
+    fmt = "%(asctime)s %(levelname)s %(name)s %(message)s" if verbose else "%(message)s"
+    logging.basicConfig(level=logging.WARNING, format=fmt, handlers=[TqdmHandler()], force=True)
+    logger.setLevel(level)
+    for name in ("urllib3", "openai", "httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 # ==========================================
@@ -168,7 +234,7 @@ def slugify(text: str, max_len: int = 50) -> str:
 
 
 def build_prompt(subject: str, style: str) -> str:
-    return f"{subject}, {style}"
+    return f"{subject}. {style}. Highly detailed, sharp focus, professional quality."
 
 
 def encode_image(image_path: Path) -> str:
@@ -180,6 +246,24 @@ def encode_image(image_path: Path) -> str:
             "See README.md for details."
         )
     return base64.b64encode(image_path.read_bytes()).decode("utf-8")
+
+
+def encode_images(image_paths: list[Path]) -> list[tuple[str, str]]:
+    """Encode multiple reference images, returning ``(b64, mime)`` pairs.
+
+    Validates that at least one image is provided and the count does not
+    exceed :data:`MAX_REFERENCE_IMAGES`.
+    """
+    if not image_paths:
+        raise FileNotFoundError("At least one reference image is required.")
+    if len(image_paths) > MAX_REFERENCE_IMAGES:
+        raise ValueError(
+            f"Too many reference images: {len(image_paths)}. "
+            f"Maximum is {MAX_REFERENCE_IMAGES}."
+        )
+    return [
+        (encode_image(p), detect_image_mime(p)) for p in image_paths
+    ]
 
 
 def extract_subject_slug(
@@ -211,22 +295,29 @@ def extract_subject_slug(
 
 
 def output_filename(
-    index: int, subject: str, pad_width: int = 2, legacy: bool = False
+    index: int, subject: str, pad_width: int = 2, legacy: bool = False,
+    ext: str = DEFAULT_OUTPUT_FORMAT,
 ) -> str:
     """Return the output filename for a generated image.
 
     Default: zero-padded index + subject slug, e.g. ``01_amethyst.png``.
     With ``legacy=True``: the original ``generation_{index}.png`` naming.
+    ``ext`` controls the file extension (defaults to ``png``).
     """
     if legacy:
-        return f"generation_{index}.png"
+        return f"generation_{index}.{ext}"
     slug = extract_subject_slug(subject)
-    return f"{index:0{pad_width}d}_{slug}.png"
+    return f"{index:0{pad_width}d}_{slug}.{ext}"
 
 
 # ==========================================
 # PROMPTS FILE
 # ==========================================
+def parse_prompts_text(text: str) -> list[str]:
+    """Split raw text into non-empty, non-comment prompt lines."""
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
+
+
 def load_prompts(path: Path) -> list[str] | None:
     """Load non-empty, non-comment prompt lines.
 
@@ -239,8 +330,7 @@ def load_prompts(path: Path) -> list[str] | None:
             encoding="utf-8",
         )
         return None
-    lines = path.read_text(encoding="utf-8").splitlines()
-    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+    return parse_prompts_text(path.read_text(encoding="utf-8"))
 
 
 # ==========================================
@@ -255,8 +345,12 @@ def _vision_prompt_hash() -> str:
     return hashlib.sha256(VISION_PROMPT.encode("utf-8")).hexdigest()[:16]
 
 
-def style_cache_valid(cache_path: Path, image_path: Path, vision_model: str) -> bool:
-    if not cache_path.exists() or not image_path.exists():
+def style_cache_valid(
+    cache_path: Path, image_paths: list[Path], vision_model: str
+) -> bool:
+    if not cache_path.exists():
+        return False
+    if not all(p.exists() for p in image_paths):
         return False
     try:
         data = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -268,8 +362,18 @@ def style_cache_valid(cache_path: Path, image_path: Path, vision_model: str) -> 
         return False
     if data.get("prompt_hash") != _vision_prompt_hash():
         return False
-    st = image_path.stat()
-    return data.get("size") == st.st_size and data.get("mtime") == int(st.st_mtime)
+    cached_images = data.get("images")
+    if not isinstance(cached_images, list):
+        return False
+    if len(cached_images) != len(image_paths):
+        return False
+    for ci, ip in zip(cached_images, image_paths, strict=True):
+        if not isinstance(ci, dict):
+            return False
+        st = ip.stat()
+        if ci.get("size") != st.st_size or ci.get("mtime") != int(st.st_mtime):
+            return False
+    return True
 
 
 def load_cached_style(cache_path: Path) -> str | None:
@@ -283,25 +387,53 @@ def load_cached_style(cache_path: Path) -> str | None:
 
 
 def save_cached_style(
-    cache_path: Path, image_path: Path, vision_model: str, style: str
+    cache_path: Path, image_paths: list[Path], vision_model: str, style: str
 ) -> None:
-    st = image_path.stat()
+    images_meta = []
+    for ip in image_paths:
+        st = ip.stat()
+        images_meta.append(
+            {"path": str(ip), "size": st.st_size, "mtime": int(st.st_mtime)}
+        )
     payload = {
-        "image": str(image_path),
+        "images": images_meta,
         "model": vision_model,
         "prompt_hash": _vision_prompt_hash(),
-        "size": st.st_size,
-        "mtime": int(st.st_mtime),
         "style": style,
     }
     cache_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    try:
+        os.chmod(cache_path, 0o600)
+    except OSError:
+        pass
 
 
 # ==========================================
 # VISION STEP
 # ==========================================
+_IMAGE_MIME_SIGNATURES: dict[bytes, str] = {
+    b"\xff\xd8\xff": "image/jpeg",
+    b"\x89PNG": "image/png",
+    b"RIFF": "image/webp",
+    b"BM": "image/bmp",
+    b"GIF8": "image/gif",
+}
+
+
+def detect_image_mime(image_path: Path) -> str:
+    """Detect image MIME type from file header bytes, with extension fallback."""
+    try:
+        head = image_path.read_bytes()[:16]
+    except OSError:
+        return "image/jpeg"
+    for sig, mime in _IMAGE_MIME_SIGNATURES.items():
+        if head.startswith(sig):
+            return mime
+    return "image/jpeg"
+
+
 @retry(
     retry=retry_if_exception_type(_VISION_RETRYABLE),
     wait=wait_exponential(multiplier=1, min=2, max=30),
@@ -310,57 +442,138 @@ def save_cached_style(
     reraise=True,
 )
 def _vision_call(
-    client: OpenAI, model: str, image_b64: str, prompt: str
+    client: OpenAI, model: str, images: list[tuple[str, str]], prompt: str,
 ) -> str:
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for b64, mime in images:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            }
+        )
     response = client.chat.completions.create(
         model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                    },
-                ],
-            }
-        ],
+        messages=[{"role": "user", "content": content}],
     )
     return response.choices[0].message.content or ""
 
 
 def resolve_style(
-    api_key: str, image_path: Path, vision_model: str, no_cache: bool
+    api_key: str, image_paths: list[Path], vision_model: str, no_cache: bool
 ) -> str:
-    cache = cache_path_for(image_path)
-    if not no_cache and style_cache_valid(cache, image_path, vision_model):
+    cache = cache_path_for(image_paths[0])
+    if not no_cache and style_cache_valid(cache, image_paths, vision_model):
         logger.info("♻️ Reusing cached style from '%s'.", cache.name)
         return load_cached_style(cache) or ""
 
     logger.info("✨ Step 1: Analyzing aesthetic style using %s...", vision_model)
-    image_b64 = encode_image(image_path)
+    images = encode_images(image_paths)
     client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key)
-    style = _vision_call(client, vision_model, image_b64, VISION_PROMPT)
-    save_cached_style(cache, image_path, vision_model, style)
+    style = _vision_call(client, vision_model, images, VISION_PROMPT)
+    save_cached_style(cache, image_paths, vision_model, style)
     return style
 
 
 # ==========================================
 # IMAGE GENERATION STEP
 # ==========================================
+def fetch_model_capabilities(api_key: str, model: str) -> ModelCapabilities:
+    """Query OpenRouter's Image API for a model's capabilities.
+
+    Returns optimistic defaults (:class:`ModelCapabilities`) on any error
+    so the pipeline degrades to the pre-existing behavior instead of
+    blocking the user when the metadata endpoint is unreachable.
+    """
+    url = f"{OPENROUTER_BASE_URL}/images/models/{model}/endpoints"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code >= 400:
+            logger.debug(
+                "Model capabilities lookup failed (HTTP %d) for '%s'; "
+                "using optimistic defaults.",
+                response.status_code, model,
+            )
+            return ModelCapabilities()
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.debug(
+            "Model capabilities lookup error for '%s': %s; "
+            "using optimistic defaults.",
+            model, exc,
+        )
+        return ModelCapabilities()
+
+    endpoints = data.get("endpoints", [])
+    if not endpoints:
+        return ModelCapabilities()
+    ep = endpoints[0]
+    supported = ep.get("supported_parameters", {})
+    return ModelCapabilities(
+        supports_img2img="input_references" in supported,
+        provider_slug=ep.get("provider_slug", "black-forest-labs"),
+        allowed_passthrough=list(ep.get("allowed_passthrough_parameters", [])),
+    )
+
+
+def _build_image_payload(
+    model: str,
+    prompt: str,
+    output_format: str,
+    ref_images: list[tuple[str, str]] | None = None,
+    steps: int | None = None,
+    guidance: float | None = None,
+    seed: int | None = None,
+    caps: ModelCapabilities | None = None,
+) -> dict:
+    payload: dict = {
+        "model": model,
+        "prompt": prompt,
+        "output_format": output_format,
+    }
+    if ref_images and (caps is None or caps.supports_img2img):
+        payload["input_references"] = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            }
+            for b64, mime in ref_images
+        ]
+    provider_slug = caps.provider_slug if caps else "black-forest-labs"
+    allowed = caps.allowed_passthrough if caps else None
+    provider_opts: dict = {}
+    if steps is not None and (allowed is None or "steps" in allowed):
+        provider_opts["steps"] = steps
+    if guidance is not None and (allowed is None or "guidance" in allowed):
+        provider_opts["guidance"] = guidance
+    if provider_opts:
+        payload["provider"] = {"options": {provider_slug: provider_opts}}
+    if seed is not None:
+        payload["seed"] = seed
+    return payload
+
+
 def _generate_image_once(
-    api_key: str, model: str, prompt: str, output_format: str
+    api_key: str,
+    model: str,
+    prompt: str,
+    output_format: str,
+    ref_images: list[tuple[str, str]] | None = None,
+    steps: int | None = None,
+    guidance: float | None = None,
+    seed: int | None = None,
+    caps: ModelCapabilities | None = None,
 ) -> tuple[dict, str]:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "output_format": output_format,
-    }
+    payload = _build_image_payload(
+        model, prompt, output_format,
+        ref_images=ref_images, steps=steps, guidance=guidance, seed=seed,
+        caps=caps,
+    )
     response = requests.post(
         OPENROUTER_IMAGES_URL,
         headers=headers,
@@ -369,11 +582,11 @@ def _generate_image_once(
     )
     if response.status_code == 429 or response.status_code >= 500:
         raise TransientAPIError(
-            f"HTTP {response.status_code} from image API: {response.text[:200]}"
+            f"HTTP {response.status_code} from image API"
         )
     if response.status_code >= 400:
         raise PermanentAPIError(
-            f"HTTP {response.status_code} from image API: {response.text[:300]}"
+            f"HTTP {response.status_code} from image API"
         )
     try:
         data = response.json()
@@ -394,9 +607,21 @@ def _generate_image_once(
     reraise=True,
 )
 def generate_image(
-    api_key: str, model: str, prompt: str, output_format: str
+    api_key: str,
+    model: str,
+    prompt: str,
+    output_format: str,
+    ref_images: list[tuple[str, str]] | None = None,
+    steps: int | None = None,
+    guidance: float | None = None,
+    seed: int | None = None,
+    caps: ModelCapabilities | None = None,
 ) -> tuple[dict, str]:
-    return _generate_image_once(api_key, model, prompt, output_format)
+    return _generate_image_once(
+        api_key, model, prompt, output_format,
+        ref_images=ref_images, steps=steps, guidance=guidance, seed=seed,
+        caps=caps,
+    )
 
 
 def save_image(img_item: dict, out_path: Path) -> None:
@@ -456,6 +681,10 @@ def write_manifest(output_dir: Path, manifest: dict[int, ManifestEntry]) -> None
     path.write_text(
         json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def should_skip(
@@ -469,6 +698,191 @@ def should_skip(
 
 
 # ==========================================
+# API KEY HELPERS
+# ==========================================
+def save_api_key_to_env(api_key: str, env_path: Path | None = None) -> None:
+    """Persist ``OPENROUTER_API_KEY`` to a ``.env`` file and reload it.
+
+    Creates the file if missing, replaces the key line if present, or appends.
+    Used by the web UI's "enter key" flow.
+    """
+    env_path = env_path or Path(".env")
+    line = f"OPENROUTER_API_KEY={api_key.strip()}"
+    if env_path.exists():
+        content = env_path.read_text(encoding="utf-8")
+        if re.search(r"^OPENROUTER_API_KEY=", content, flags=re.MULTILINE):
+            new_content = re.sub(
+                r"^OPENROUTER_API_KEY=.*$", line, content, flags=re.MULTILINE
+            )
+            env_path.write_text(new_content, encoding="utf-8")
+        else:
+            env_path.write_text(
+                content.rstrip("\n") + "\n" + line + "\n", encoding="utf-8"
+            )
+    else:
+        env_path.write_text(line + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+    load_dotenv(override=True)
+
+
+# ==========================================
+# GENERATION ORCHESTRATOR (shared by CLI + web UI)
+# ==========================================
+def run_generation(
+    api_key: str,
+    image_paths: list[Path],
+    subjects: list[str],
+    output_dir: Path,
+    options: GenerationOptions,
+    caps: ModelCapabilities | None = None,
+) -> Iterator[GenEvent]:
+    """Run the full pipeline, yielding :class:`GenEvent`s for live UI updates.
+
+    Yields events in this order:
+    ``style_start`` → ``style_done`` (or ``style_error``) → ``queue`` →
+    per subject: ``gen_start`` → ``gen_done`` | ``skip`` | ``gen_error`` →
+    ``done``.
+
+    In ``dry_run`` mode, yields ``style_start`` → ``style_done`` →
+    per subject: ``dry_run`` → ``done`` (no image API calls).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Step 1: style extraction ---
+    yield GenEvent("style_start", {"model": options.vision_model})
+    try:
+        extracted_style = resolve_style(
+            api_key, image_paths, options.vision_model, options.no_cache
+        )
+    except Exception as e:  # noqa: BLE001
+        yield GenEvent("style_error", {"error": str(e)})
+        return
+    yield GenEvent("style_done", {"style": extracted_style})
+
+    total = len(subjects)
+    yield GenEvent("queue", {"total": total})
+
+    # --- Dry-run: print merged prompts only ---
+    if options.dry_run:
+        for i, subject in enumerate(subjects, start=1):
+            merged = build_prompt(subject, extracted_style)
+            yield GenEvent(
+                "dry_run", {"index": i, "total": total, "merged_prompt": merged}
+            )
+        yield GenEvent("done", {"output_dir": str(output_dir)})
+        return
+
+    # --- Encode reference images once for img2img (if enabled) ---
+    ref_images: list[tuple[str, str]] | None = None
+    if not options.no_img2img:
+        ref_images = encode_images(image_paths)
+
+    # --- Step 2: generation loop ---
+    manifest = load_manifest(output_dir)
+    pad_width = max(2, len(str(total)))
+
+    for index, subject in enumerate(subjects, start=1):
+        merged_prompt = build_prompt(subject, extracted_style)
+        file_path = output_dir / output_filename(
+            index, subject, pad_width=pad_width, legacy=options.legacy_names,
+            ext=options.output_format,
+        )
+        entry = manifest.get(index)
+
+        yield GenEvent(
+            "gen_start",
+            {"index": index, "total": total, "subject": subject},
+        )
+
+        if should_skip(file_path, subject, entry, options.force):
+            manifest[index] = ManifestEntry(
+                index=index,
+                subject=subject,
+                style=extracted_style,
+                merged_prompt=merged_prompt,
+                model=options.image_model,
+                timestamp=now_iso(),
+                filename=file_path.name,
+                source="skip",
+                skipped=True,
+            )
+            yield GenEvent(
+                "skip",
+                {
+                    "index": index,
+                    "total": total,
+                    "subject": subject,
+                    "filename": file_path.name,
+                },
+            )
+            continue
+
+        try:
+            img_item, source = generate_image(
+                api_key, options.image_model, merged_prompt, options.output_format,
+                ref_images=ref_images,
+                steps=options.steps,
+                guidance=options.guidance,
+                seed=options.seed,
+                caps=caps,
+            )
+            save_image(img_item, file_path)
+        except Exception as e:  # noqa: BLE001
+            manifest[index] = ManifestEntry(
+                index=index,
+                subject=subject,
+                style=extracted_style,
+                merged_prompt=merged_prompt,
+                model=options.image_model,
+                timestamp=now_iso(),
+                filename=file_path.name,
+                source="error",
+                error=str(e),
+            )
+            yield GenEvent(
+                "gen_error",
+                {
+                    "index": index,
+                    "total": total,
+                    "subject": subject,
+                    "filename": file_path.name,
+                    "error": str(e),
+                },
+            )
+            time.sleep(options.cooldown)
+            continue
+
+        manifest[index] = ManifestEntry(
+            index=index,
+            subject=subject,
+            style=extracted_style,
+            merged_prompt=merged_prompt,
+            model=options.image_model,
+            timestamp=now_iso(),
+            filename=file_path.name,
+            source=source,
+        )
+        yield GenEvent(
+            "gen_done",
+            {
+                "index": index,
+                "total": total,
+                "subject": subject,
+                "filename": file_path.name,
+                "file_path": str(file_path),
+                "source": source,
+            },
+        )
+        time.sleep(options.cooldown)
+
+    write_manifest(output_dir, manifest)
+    yield GenEvent("done", {"output_dir": str(output_dir)})
+
+
+# ==========================================
 # CLI
 # ==========================================
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -476,7 +890,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Automated image generation pipeline using OpenRouter.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--image", default=DEFAULT_SAMPLE_IMAGE, help="Reference style image.")
+    parser.add_argument(
+        "--image",
+        nargs="+",
+        default=[DEFAULT_SAMPLE_IMAGE],
+        help=f"Reference style image path(s), up to {MAX_REFERENCE_IMAGES}.",
+    )
     parser.add_argument("--prompts", default=DEFAULT_PROMPTS_FILE, help="Prompts file path.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT_DIR, help="Output directory.")
     parser.add_argument("--vision-model", default=DEFAULT_VISION_MODEL, help="Vision model.")
@@ -497,6 +916,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Use generation_N.png filenames instead of descriptive ones.",
     )
     parser.add_argument("--force", action="store_true", help="Regenerate existing outputs.")
+    parser.add_argument(
+        "--output-format",
+        choices=["png", "jpeg", "webp"],
+        default=DEFAULT_OUTPUT_FORMAT,
+        help="Image format for generated outputs.",
+    )
+    parser.add_argument(
+        "--no-img2img",
+        action="store_true",
+        help="Disable image-to-image (don't pass reference images to the image model).",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="FLUX inference steps (1-100, higher = more refined). Default uses model's own.",
+    )
+    parser.add_argument(
+        "--guidance",
+        type=float,
+        default=None,
+        help="FLUX guidance scale (0-20, higher = follows prompt more closely).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Fixed seed for reproducible generation. Omit for random.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     return parser.parse_args(argv)
 
@@ -517,106 +965,137 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    image_path = Path(args.image)
+    image_paths = [Path(p) for p in args.image]
+    if len(image_paths) > MAX_REFERENCE_IMAGES:
+        logger.error(
+            "Too many reference images: %d. Maximum is %d.",
+            len(image_paths), MAX_REFERENCE_IMAGES,
+        )
+        return 2
     prompts_path = Path(args.prompts)
     output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Step 1: style extraction (cached when possible) ---
-    try:
-        extracted_style = resolve_style(
-            api_key, image_path, args.vision_model, args.no_cache
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.error("❌ Failed to parse style image: %s", e)
-        return 1
-    logger.info("🎨 Extracted Style Anchor:\n> %s\n", extracted_style)
-
-    # --- Step 2: load prompts ---
     subjects = load_prompts(prompts_path)
     if subjects is None:
         logger.info("ℹ️ Created a starter prompts file: '%s'. Populate it and rerun.", prompts_path)
         return 0
-    logger.info("📦 Successfully loaded %d items from your queue.\n", len(subjects))
 
-    if args.dry_run:
-        logger.info("🧪 Dry-run mode: no images will be generated.")
-        for i, subject in enumerate(subjects, start=1):
+    options = GenerationOptions(
+        vision_model=args.vision_model,
+        image_model=args.image_model,
+        cooldown=args.cooldown,
+        no_cache=args.no_cache,
+        force=args.force,
+        legacy_names=args.legacy_names,
+        dry_run=args.dry_run,
+        output_format=args.output_format,
+        no_img2img=args.no_img2img,
+        steps=args.steps,
+        guidance=args.guidance,
+        seed=args.seed,
+    )
+
+    # --- Check model capabilities and warn/fallback for unsupported features ---
+    caps = fetch_model_capabilities(api_key, options.image_model)
+
+    if not caps.supports_img2img and not options.no_img2img and image_paths:
+        logger.warning(
+            "⚠️  Model '%s' doesn't support image references (img2img). "
+            "Consider using '%s' for best results.",
+            options.image_model, DEFAULT_IMAGE_MODEL,
+        )
+        if options.dry_run:
+            logger.info("ℹ️ Dry-run: automatically continuing without image references.")
+            options.no_img2img = True
+        else:
+            response = input("Continue without image references? [Y/n] ").strip().lower()
+            if response == "n":
+                logger.info(
+                    "Aborting. Try --image-model %s or pass --no-img2img.",
+                    DEFAULT_IMAGE_MODEL,
+                )
+                return 1
+            options.no_img2img = True
+
+    if (
+        options.steps is not None
+        and caps.allowed_passthrough is not None
+        and "steps" not in caps.allowed_passthrough
+    ):
+        logger.info(
+            "ℹ️ Model '%s' doesn't support 'steps'; ignoring.",
+            options.image_model,
+        )
+        options.steps = None
+
+    if (
+        options.guidance is not None
+        and caps.allowed_passthrough is not None
+        and "guidance" not in caps.allowed_passthrough
+    ):
+        logger.info(
+            "ℹ️ Model '%s' doesn't support 'guidance'; ignoring.",
+            options.image_model,
+        )
+        options.guidance = None
+
+    total = len(subjects)
+    pbar: tqdm | None = None
+
+    for event in run_generation(
+        api_key, image_paths, subjects, output_dir, options, caps=caps
+    ):
+        kind = event.kind
+        p = event.payload
+
+        if kind == "style_done":
+            logger.info("🎨 Extracted Style Anchor:\n> %s\n", p["style"])
+            logger.info("📦 Successfully loaded %d items from your queue.\n", total)
+        elif kind == "style_error":
+            logger.error("❌ Failed to parse style image: %s", p["error"])
+            return 1
+        elif kind == "queue":
+            if options.dry_run:
+                logger.info("🧪 Dry-run mode: no images will be generated.")
+            else:
+                logger.info("🚀 Initializing generation queue on model: %s...", args.image_model)
+                pbar = tqdm(total=total, desc="Generating", unit="img")
+        elif kind == "dry_run":
             logger.info(
                 "[%d/%d] (dry-run) merged prompt: '%s'",
-                i,
-                len(subjects),
-                build_prompt(subject, extracted_style),
+                p["index"],
+                p["total"],
+                p["merged_prompt"],
             )
-        return 0
-
-    # --- Step 3: generation loop ---
-    logger.info("🚀 Initializing generation queue on model: %s...", args.image_model)
-    manifest = load_manifest(output_dir)
-    total = len(subjects)
-    pad_width = max(2, len(str(total)))
-
-    pbar = tqdm(subjects, desc="Generating", unit="img")
-    for index, subject in enumerate(pbar, start=1):
-        pbar.set_postfix_str(subject[:30])
-        merged_prompt = build_prompt(subject, extracted_style)
-        file_path = output_dir / output_filename(
-            index, subject, pad_width=pad_width, legacy=args.legacy_names
-        )
-        entry = manifest.get(index)
-
-        if should_skip(file_path, subject, entry, args.force):
-            logger.info("[%d/%d] Skipped (already generated): '%s'", index, total, subject[:40])
-            manifest[index] = ManifestEntry(
-                index=index,
-                subject=subject,
-                style=extracted_style,
-                merged_prompt=merged_prompt,
-                model=args.image_model,
-                timestamp=now_iso(),
-                filename=file_path.name,
-                source="skip",
-                skipped=True,
+        elif kind == "gen_start":
+            if pbar is not None:
+                pbar.set_postfix_str(p["subject"][:30])
+            logger.info(
+                "[%d/%d] Generating target: '%s'",
+                p["index"], p["total"], p["subject"][:40],
             )
-            continue
-
-        logger.info("[%d/%d] Generating target: '%s'", index, total, subject[:40])
-        try:
-            img_item, source = generate_image(
-                api_key, args.image_model, merged_prompt, DEFAULT_OUTPUT_FORMAT
+        elif kind == "skip":
+            if pbar is not None:
+                pbar.update(1)
+            logger.info(
+                "[%d/%d] Skipped (already generated): '%s'",
+                p["index"],
+                p["total"],
+                p["subject"][:40],
             )
-            save_image(img_item, file_path)
-        except Exception as e:  # noqa: BLE001
-            logger.error("❌ Error occurred generating index %d: %s", index, e)
-            manifest[index] = ManifestEntry(
-                index=index,
-                subject=subject,
-                style=extracted_style,
-                merged_prompt=merged_prompt,
-                model=args.image_model,
-                timestamp=now_iso(),
-                filename=file_path.name,
-                source="error",
-                error=str(e),
-            )
-            time.sleep(args.cooldown)
-            continue
+        elif kind == "gen_done":
+            if pbar is not None:
+                pbar.update(1)
+            logger.info("💾 File Saved -> %s", p["filename"])
+        elif kind == "gen_error":
+            if pbar is not None:
+                pbar.update(1)
+            logger.error("❌ Error occurred generating index %d: %s", p["index"], p["error"])
+        elif kind == "done":
+            if pbar is not None:
+                pbar.close()
+            logger.info("🎉 Process completed! Outputs are in '%s'.", p["output_dir"])
 
-        logger.info("💾 File Saved -> %s", file_path)
-        manifest[index] = ManifestEntry(
-            index=index,
-            subject=subject,
-            style=extracted_style,
-            merged_prompt=merged_prompt,
-            model=args.image_model,
-            timestamp=now_iso(),
-            filename=file_path.name,
-            source=source,
-        )
-        time.sleep(args.cooldown)
-
-    write_manifest(output_dir, manifest)
-    logger.info("🎉 Process completed! Outputs are in '%s'.", output_dir)
     return 0
 
 

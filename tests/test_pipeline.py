@@ -58,7 +58,10 @@ def test_slugify_empty_fallback():
 
 
 def test_build_prompt_merges_subject_and_style():
-    assert rp.build_prompt("a lion", "dark mood") == "a lion, dark mood"
+    assert (
+        rp.build_prompt("a lion", "dark mood")
+        == "a lion. dark mood. Highly detailed, sharp focus, professional quality."
+    )
 
 
 def test_extract_subject_slug_single_word():
@@ -140,9 +143,9 @@ def test_style_cache_roundtrip(tmp_path):
     img.write_bytes(b"imgdata")
     cache = rp.cache_path_for(img)
 
-    assert rp.style_cache_valid(cache, img, "model-a") is False
-    rp.save_cached_style(cache, img, "model-a", "dark moody palette")
-    assert rp.style_cache_valid(cache, img, "model-a") is True
+    assert rp.style_cache_valid(cache, [img], "model-a") is False
+    rp.save_cached_style(cache, [img], "model-a", "dark moody palette")
+    assert rp.style_cache_valid(cache, [img], "model-a") is True
     assert rp.load_cached_style(cache) == "dark moody palette"
 
 
@@ -150,18 +153,18 @@ def test_style_cache_invalidates_on_model_change(tmp_path):
     img = tmp_path / "ref.jpeg"
     img.write_bytes(b"imgdata")
     cache = rp.cache_path_for(img)
-    rp.save_cached_style(cache, img, "model-a", "style")
-    assert rp.style_cache_valid(cache, img, "model-b") is False
+    rp.save_cached_style(cache, [img], "model-a", "style")
+    assert rp.style_cache_valid(cache, [img], "model-b") is False
 
 
 def test_style_cache_invalidates_on_content_change(tmp_path):
     img = tmp_path / "ref.jpeg"
     img.write_bytes(b"imgdata")
     cache = rp.cache_path_for(img)
-    rp.save_cached_style(cache, img, "model-a", "style")
+    rp.save_cached_style(cache, [img], "model-a", "style")
     # Change the file content (size + mtime change).
     img.write_bytes(b"different")
-    assert rp.style_cache_valid(cache, img, "model-a") is False
+    assert rp.style_cache_valid(cache, [img], "model-a") is False
 
 
 # --------------------------------------------------------------------------- #
@@ -292,6 +295,282 @@ def test_generate_image_once_empty_data(monkeypatch):
         rp._generate_image_once("key", "model", "prompt", "png")
 
 
+def test_generate_image_once_with_input_references(monkeypatch):
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["json"] = json
+        return FakeResponse(json_data={"data": [{"b64_json": "aGVsbG8="}]})
+
+    monkeypatch.setattr(rp.requests, "post", fake_post)
+    ref_images = [("dGVzdA==", "image/jpeg")]
+    rp._generate_image_once(
+        "key", "model", "prompt", "png", ref_images=ref_images,
+    )
+    payload = captured["json"]
+    assert "input_references" in payload
+    assert len(payload["input_references"]) == 1
+    assert payload["input_references"][0]["type"] == "image_url"
+    assert "data:image/jpeg;base64,dGVzdA==" in payload["input_references"][0]["image_url"]["url"]
+
+
+def test_generate_image_once_with_steps_and_guidance(monkeypatch):
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["json"] = json
+        return FakeResponse(json_data={"data": [{"b64_json": "aGVsbG8="}]})
+
+    monkeypatch.setattr(rp.requests, "post", fake_post)
+    rp._generate_image_once(
+        "key", "model", "prompt", "png", steps=40, guidance=3.5,
+    )
+    payload = captured["json"]
+    assert payload["provider"]["options"]["black-forest-labs"]["steps"] == 40
+    assert payload["provider"]["options"]["black-forest-labs"]["guidance"] == 3.5
+
+
+def test_generate_image_once_with_seed(monkeypatch):
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["json"] = json
+        return FakeResponse(json_data={"data": [{"b64_json": "aGVsbG8="}]})
+
+    monkeypatch.setattr(rp.requests, "post", fake_post)
+    rp._generate_image_once("key", "model", "prompt", "png", seed=42)
+    assert captured["json"]["seed"] == 42
+
+
+def test_generate_image_once_without_optional_params(monkeypatch):
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["json"] = json
+        return FakeResponse(json_data={"data": [{"b64_json": "aGVsbG8="}]})
+
+    monkeypatch.setattr(rp.requests, "post", fake_post)
+    rp._generate_image_once("key", "model", "prompt", "png")
+    payload = captured["json"]
+    assert "input_references" not in payload
+    assert "provider" not in payload
+    assert "seed" not in payload
+
+
+def test_generation_options_validates_steps():
+    with pytest.raises(ValueError, match="steps"):
+        rp.GenerationOptions(steps=0)
+    with pytest.raises(ValueError, match="steps"):
+        rp.GenerationOptions(steps=101)
+
+
+def test_generation_options_validates_guidance():
+    with pytest.raises(ValueError, match="guidance"):
+        rp.GenerationOptions(guidance=-1)
+    with pytest.raises(ValueError, match="guidance"):
+        rp.GenerationOptions(guidance=21)
+
+
+def test_generation_options_validates_seed():
+    with pytest.raises(ValueError, match="seed"):
+        rp.GenerationOptions(seed=-1)
+
+
+# --------------------------------------------------------------------------- #
+# ModelCapabilities defaults
+# --------------------------------------------------------------------------- #
+def test_model_capabilities_defaults_are_optimistic():
+    caps = rp.ModelCapabilities()
+    assert caps.supports_img2img is True
+    assert caps.provider_slug == "black-forest-labs"
+    assert caps.allowed_passthrough is None
+
+
+# --------------------------------------------------------------------------- #
+# fetch_model_capabilities
+# --------------------------------------------------------------------------- #
+def test_fetch_model_capabilities_supported(monkeypatch):
+    endpoint_data = {
+        "id": "black-forest-labs/flux.2-pro",
+        "endpoints": [
+            {
+                "provider_name": "Black Forest Labs",
+                "provider_slug": "black-forest-labs",
+                "supported_parameters": {
+                    "output_format": {"type": "enum", "values": ["png", "jpeg"]},
+                    "input_references": {"type": "range", "min": 0, "max": 8},
+                    "seed": {"type": "boolean"},
+                },
+                "allowed_passthrough_parameters": ["steps", "guidance", "safety_tolerance"],
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        rp.requests,
+        "get",
+        lambda *a, **k: FakeResponse(json_data=endpoint_data, status_code=200),
+    )
+    caps = rp.fetch_model_capabilities("key", "black-forest-labs/flux.2-pro")
+    assert caps.supports_img2img is True
+    assert caps.provider_slug == "black-forest-labs"
+    assert "steps" in caps.allowed_passthrough
+    assert "guidance" in caps.allowed_passthrough
+
+
+def test_fetch_model_capabilities_unsupported_img2img(monkeypatch):
+    endpoint_data = {
+        "id": "some/model",
+        "endpoints": [
+            {
+                "provider_name": "Some Provider",
+                "provider_slug": "some-provider",
+                "supported_parameters": {
+                    "output_format": {"type": "enum", "values": ["png", "jpeg"]},
+                    "seed": {"type": "boolean"},
+                },
+                "allowed_passthrough_parameters": [],
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        rp.requests,
+        "get",
+        lambda *a, **k: FakeResponse(json_data=endpoint_data, status_code=200),
+    )
+    caps = rp.fetch_model_capabilities("key", "some/model")
+    assert caps.supports_img2img is False
+    assert caps.provider_slug == "some-provider"
+    assert caps.allowed_passthrough == []
+
+
+def test_fetch_model_capabilities_http_error_returns_defaults(monkeypatch):
+    monkeypatch.setattr(
+        rp.requests,
+        "get",
+        lambda *a, **k: FakeResponse(status_code=404, text="not found"),
+    )
+    caps = rp.fetch_model_capabilities("key", "nonexistent/model")
+    assert caps.supports_img2img is True
+    assert caps.provider_slug == "black-forest-labs"
+    assert caps.allowed_passthrough is None
+
+
+def test_fetch_model_capabilities_network_error_returns_defaults(monkeypatch):
+    def raise_error(*a, **k):
+        raise rp.requests.RequestException("network down")
+
+    monkeypatch.setattr(rp.requests, "get", raise_error)
+    caps = rp.fetch_model_capabilities("key", "any/model")
+    assert caps.supports_img2img is True
+    assert caps.provider_slug == "black-forest-labs"
+    assert caps.allowed_passthrough is None
+
+
+def test_fetch_model_capabilities_empty_endpoints_returns_defaults(monkeypatch):
+    monkeypatch.setattr(
+        rp.requests,
+        "get",
+        lambda *a, **k: FakeResponse(json_data={"endpoints": []}, status_code=200),
+    )
+    caps = rp.fetch_model_capabilities("key", "some/model")
+    assert caps.supports_img2img is True
+    assert caps.provider_slug == "black-forest-labs"
+
+
+# --------------------------------------------------------------------------- #
+# _build_image_payload with caps
+# --------------------------------------------------------------------------- #
+def test_build_image_payload_caps_suppresses_input_references():
+    caps = rp.ModelCapabilities(
+        supports_img2img=False,
+        provider_slug="some-provider",
+        allowed_passthrough=[],
+    )
+    payload = rp._build_image_payload(
+        "model", "prompt", "png",
+        ref_images=[("dGVzdA==", "image/jpeg")],
+        caps=caps,
+    )
+    assert "input_references" not in payload
+
+
+def test_build_image_payload_caps_allows_input_references():
+    caps = rp.ModelCapabilities(
+        supports_img2img=True,
+        provider_slug="black-forest-labs",
+        allowed_passthrough=["steps", "guidance"],
+    )
+    payload = rp._build_image_payload(
+        "model", "prompt", "png",
+        ref_images=[("dGVzdA==", "image/jpeg")],
+        caps=caps,
+    )
+    assert "input_references" in payload
+    assert len(payload["input_references"]) == 1
+
+
+def test_build_image_payload_caps_uses_provider_slug():
+    caps = rp.ModelCapabilities(
+        supports_img2img=True,
+        provider_slug="openai",
+        allowed_passthrough=["steps"],
+    )
+    payload = rp._build_image_payload(
+        "model", "prompt", "png",
+        steps=30,
+        caps=caps,
+    )
+    assert "openai" in payload["provider"]["options"]
+    assert "black-forest-labs" not in payload["provider"]["options"]
+    assert payload["provider"]["options"]["openai"]["steps"] == 30
+
+
+def test_build_image_payload_caps_filters_unsupported_passthrough():
+    caps = rp.ModelCapabilities(
+        supports_img2img=True,
+        provider_slug="openai",
+        allowed_passthrough=["moderation"],
+    )
+    payload = rp._build_image_payload(
+        "model", "prompt", "png",
+        steps=40,
+        guidance=3.5,
+        caps=caps,
+    )
+    # steps and guidance are NOT in allowed_passthrough, so neither should appear
+    assert "provider" not in payload
+
+
+def test_build_image_payload_caps_none_preserves_legacy_behavior():
+    payload = rp._build_image_payload(
+        "model", "prompt", "png",
+        ref_images=[("dGVzdA==", "image/jpeg")],
+        steps=40,
+        guidance=3.5,
+        seed=42,
+    )
+    assert "input_references" in payload
+    assert payload["provider"]["options"]["black-forest-labs"]["steps"] == 40
+    assert payload["provider"]["options"]["black-forest-labs"]["guidance"] == 3.5
+    assert payload["seed"] == 42
+
+
+def test_build_image_payload_caps_allowed_passthrough_none_keeps_steps():
+    caps = rp.ModelCapabilities(
+        supports_img2img=True,
+        provider_slug="black-forest-labs",
+        allowed_passthrough=None,
+    )
+    payload = rp._build_image_payload(
+        "model", "prompt", "png",
+        steps=40,
+        guidance=3.5,
+        caps=caps,
+    )
+    assert payload["provider"]["options"]["black-forest-labs"]["steps"] == 40
+    assert payload["provider"]["options"]["black-forest-labs"]["guidance"] == 3.5
+
+
 # --------------------------------------------------------------------------- #
 # save_image
 # --------------------------------------------------------------------------- #
@@ -353,8 +632,8 @@ def test_main_dry_run(monkeypatch, tmp_path, capsys):
     assert rc == 0
     captured = capsys.readouterr()
     assert "Dry-run mode" in captured.out
-    assert "a lion, dark moody palette" in captured.out
-    assert "a bike, dark moody palette" in captured.out
+    assert "a lion. dark moody palette" in captured.out
+    assert "a bike. dark moody palette" in captured.out
     assert not out.exists() or not any(out.iterdir())
 
 
@@ -399,7 +678,7 @@ def test_main_generates_and_writes_manifest(monkeypatch, tmp_path):
 
     calls = {"generate": 0}
 
-    def fake_generate_image(api_key, model, prompt, fmt):
+    def fake_generate_image(api_key, model, prompt, fmt, **k):
         calls["generate"] += 1
         return ({"b64_json": base64.b64encode(b"png-bytes").decode()}, "b64")
 
@@ -535,7 +814,7 @@ def test_main_uses_cached_style(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     # Pre-seed a valid cache.
     cache = rp.cache_path_for(img)
-    rp.save_cached_style(cache, img, rp.DEFAULT_VISION_MODEL, "cached style")
+    rp.save_cached_style(cache, [img], rp.DEFAULT_VISION_MODEL, "cached style")
 
     vision_calls = {"n": 0}
 
@@ -585,3 +864,150 @@ def test_main_handles_generation_error(monkeypatch, tmp_path, capsys):
     manifest = rp.load_manifest(out)
     assert manifest[1].error == "boom"
     assert manifest[1].source == "error"
+
+
+# --------------------------------------------------------------------------- #
+# main() capability detection — interactive prompt flow
+# --------------------------------------------------------------------------- #
+def test_main_unsupported_img2img_user_continues(monkeypatch, tmp_path):
+    img, prompts = _seed_inputs(tmp_path)
+    out = tmp_path / "outputs"
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(rp, "_vision_call", lambda *a, **k: "dark style")
+    monkeypatch.setattr(
+        rp,
+        "fetch_model_capabilities",
+        lambda *a, **k: rp.ModelCapabilities(
+            supports_img2img=False, provider_slug="openai", allowed_passthrough=[],
+        ),
+    )
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+
+    gen_calls = []
+
+    def fake_generate(api_key, model, prompt, fmt, **k):
+        gen_calls.append(k)
+        return ({"b64_json": base64.b64encode(b"png").decode()}, "b64")
+
+    monkeypatch.setattr(rp, "generate_image", fake_generate)
+
+    rc = rp.main(
+        [
+            "--image", str(img),
+            "--prompts", str(prompts),
+            "--output", str(out),
+            "--no-cache",
+            "--cooldown", "0",
+        ]
+    )
+    assert rc == 0
+    assert (out / "01_lion.png").exists()
+
+
+def test_main_unsupported_img2img_user_aborts(monkeypatch, tmp_path):
+    img, prompts = _seed_inputs(tmp_path)
+    out = tmp_path / "outputs"
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(rp, "_vision_call", lambda *a, **k: "dark style")
+    monkeypatch.setattr(
+        rp,
+        "fetch_model_capabilities",
+        lambda *a, **k: rp.ModelCapabilities(
+            supports_img2img=False, provider_slug="openai", allowed_passthrough=[],
+        ),
+    )
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+
+    def fail_if_called(*a, **k):
+        pytest.fail("generate_image must not be called when user aborts")
+
+    monkeypatch.setattr(rp, "generate_image", fail_if_called)
+
+    rc = rp.main(
+        [
+            "--image", str(img),
+            "--prompts", str(prompts),
+            "--output", str(out),
+            "--no-cache",
+            "--cooldown", "0",
+        ]
+    )
+    assert rc == 1
+
+
+def test_main_unsupported_img2img_dry_run_auto_suppresses(monkeypatch, tmp_path, capsys):
+    img, prompts = _seed_inputs(tmp_path)
+    out = tmp_path / "outputs"
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(rp, "_vision_call", lambda *a, **k: "dark style")
+    monkeypatch.setattr(
+        rp,
+        "fetch_model_capabilities",
+        lambda *a, **k: rp.ModelCapabilities(
+            supports_img2img=False, provider_slug="openai", allowed_passthrough=[],
+        ),
+    )
+
+    input_called = {"n": 0}
+    monkeypatch.setattr("builtins.input", lambda *a: input_called.__setitem__("n", input_called["n"] + 1) or "y")
+
+    def fail_if_called(*a, **k):
+        pytest.fail("generate_image must not be called in dry-run")
+
+    monkeypatch.setattr(rp, "generate_image", fail_if_called)
+
+    rc = rp.main(
+        [
+            "--image", str(img),
+            "--prompts", str(prompts),
+            "--output", str(out),
+            "--dry-run",
+            "--no-cache",
+        ]
+    )
+    assert rc == 0
+    assert input_called["n"] == 0  # no interactive prompt in dry-run
+    captured = capsys.readouterr()
+    assert "Dry-run" in captured.out
+
+
+def test_main_unsupported_steps_silently_dropped(monkeypatch, tmp_path):
+    img, prompts = _seed_inputs(tmp_path)
+    out = tmp_path / "outputs"
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(rp, "_vision_call", lambda *a, **k: "dark style")
+    monkeypatch.setattr(
+        rp,
+        "fetch_model_capabilities",
+        lambda *a, **k: rp.ModelCapabilities(
+            supports_img2img=True, provider_slug="openai", allowed_passthrough=[],
+        ),
+    )
+
+    captured_kwargs = {}
+
+    def fake_generate(api_key, model, prompt, fmt, **k):
+        captured_kwargs.update(k)
+        return ({"b64_json": base64.b64encode(b"png").decode()}, "b64")
+
+    monkeypatch.setattr(rp, "generate_image", fake_generate)
+
+    rc = rp.main(
+        [
+            "--image", str(img),
+            "--prompts", str(prompts),
+            "--output", str(out),
+            "--no-cache",
+            "--cooldown", "0",
+            "--steps", "40",
+            "--guidance", "3.5",
+        ]
+    )
+    assert rc == 0
+    # steps and guidance should have been silently dropped
+    assert captured_kwargs.get("steps") is None
+    assert captured_kwargs.get("guidance") is None

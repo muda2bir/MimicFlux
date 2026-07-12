@@ -1,6 +1,2 @@
-prompt_1
-prompt_2
-.
-.
-.
-.
+A premium, photorealistic mockup of a modern business card for a global software and SaaS company, lying on a dark textured slate background with subtle moody lighting. The business card features a clean, minimalist design with a matte black finish and sharp, elegant typography. The company logo and accents use a sophisticated holographic foil that catches the light with deep blues and teals. The layout is spacious and professional, exuding high-end tech, cutting-edge software engineering, and global credibility. Extreme detail, 8k resolution, cinematic lighting, shallow depth of field. --ar 16:9
+A close-up studio shot of a luxurious, high-end business card for an international software development firm. The card is made of a premium, thick-textured off-white cardstock with blind debossed geometric patterns that mimic abstract network nodes or global connections. The text is printed in a crisp, dark charcoal sans-serif font, accompanied by a subtle brushed platinum or silver metallic edge painting. The composition is angled and dynamic, casting soft shadows, perfectly showcasing a balance between elite corporate software solutions and innovative SaaS design. Photorealistic, ultra-detailed texture, professional branding photography. --ar 16:9
